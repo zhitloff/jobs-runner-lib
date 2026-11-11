@@ -4,7 +4,7 @@
 
   <groupId>ru.sarteam</groupId>
   <artifactId>jobs-runner-lib</artifactId>
-  <version>1.0.1</version>
+  <version>1.0.2</version>
   <packaging>jar</packaging>
 
   <name>jobs-runner-lib</name>

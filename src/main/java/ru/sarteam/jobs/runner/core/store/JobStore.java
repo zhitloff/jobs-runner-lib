@@ -89,7 +89,7 @@ public interface JobStore {
             }
             case JobResult.Failure<?> failure -> {
                 job.setStatus(JobStatus.ERROR);
-                job.setError(failure.error().getMessage());
+                job.setError(failure.toString());
             }
         }
         job.setStoppedAt(Instant.now());
