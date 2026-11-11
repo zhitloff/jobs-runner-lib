@@ -10,12 +10,13 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Тесты эмуляции {@code select for update} в {@link InmemoryJobStore}:
- * блокировка задач при выборке и однократный захват задачи на выполнение.
+ * Тесты {@link InmemoryJobStore}: выборка задач без блокировки и однократный захват
+ * задачи на выполнение.
  */
 class InmemoryJobStoreTest {
 
@@ -23,45 +24,46 @@ class InmemoryJobStoreTest {
     private final InmemoryJobStore jobStore = new InmemoryJobStore();
 
     /**
-     * Проверяет, что задача остаётся залоченной до {@code tryMarkRunning}, а после захвата
-     * не возвращается уже по статусу.
+     * Проверяет, что выборка отдаёт только задачи в статусе {@code SCHEDULED},
+     * в порядке от более старых и с учётом лимита.
      */
     @Test
-    void findAllWithLock_jobIsLockedUntilTryMarkRunning() {
-        final Job job = addJob("Job-1");
-
-        final List<Job> firstCall = jobStore.findAllWithLock(Instant.now(), 2);
-        assertEquals(List.of(job), firstCall);
-
-        // параллельный вызов не должен взять уже залоченую задачу
-        assertTrue(jobStore.findAllWithLock(Instant.now(), 2).isEmpty());
-
-        assertTrue(jobStore.tryMarkRunning(job.getId(), Instant.now()));
-        assertEquals(JobStatus.RUNNING, job.getStatus());
-
-        // после захвата задача не возвращается уже по статусу
-        assertTrue(jobStore.findAllWithLock(Instant.now(), 2).isEmpty());
-    }
-
-    /**
-     * Проверяет, что залоченная задача пропускается, а лимит добирается оставшимися задачами.
-     */
-    @Test
-    void findAllWithLock_skipsLockedJobsAndRespectsLimit() {
+    void findAllByLimit_returnsScheduledJobsAndRespectsLimit() {
         final Job first = addJob("Job-1");
         final Job second = addJob("Job-2");
         final Instant now = Instant.now();
 
-        final List<Job> firstCall = jobStore.findAllWithLock(now, 1);
-        assertEquals(1, firstCall.size());
-        final Job lockedJob = firstCall.get(0);
-
-        // залоченная задача не попадает в выборку, поэтому второй вызов отдаёт оставшуюся
-        final List<Job> secondCall = jobStore.findAllWithLock(now, 2);
-        assertEquals(1, secondCall.size());
-        assertNotEquals(lockedJob.getId(), secondCall.get(0).getId());
+        final List<Job> selected = jobStore.findAllByLimit(now, 10);
         assertEquals(Set.of(first.getId(), second.getId()),
-                Set.of(lockedJob.getId(), secondCall.get(0).getId()));
+                selected.stream().map(Job::getId).collect(Collectors.toSet()));
+
+        final List<Instant> createdAt = selected.stream().map(Job::getCreatedAt).toList();
+        assertEquals(createdAt.stream().sorted().toList(), createdAt, "сначала более старые");
+
+        assertEquals(1, jobStore.findAllByLimit(now, 1).size());
+        assertTrue(jobStore.findAllByLimit(now, 0).isEmpty(), "при limit <= 0 выборка пуста");
+    }
+
+    /**
+     * Проверяет, что выборка не блокирует задачи: повторный вызов получает их же,
+     * а от двойного запуска защищает только {@code tryMarkRunning}.
+     */
+    @Test
+    void findAllByLimit_doesNotLockJobs() {
+        final Job job = addJob("Job-1");
+        final Instant now = Instant.now();
+
+        final List<Job> firstCall = jobStore.findAllByLimit(now, 2);
+        assertEquals(List.of(job), firstCall);
+
+        // блокировки нет: параллельный вызов получает ту же задачу
+        assertEquals(firstCall, jobStore.findAllByLimit(now, 2));
+
+        assertTrue(jobStore.tryMarkRunning(job.getId(), now));
+        assertEquals(JobStatus.RUNNING, job.getStatus());
+
+        // после захвата задача не возвращается уже по статусу
+        assertTrue(jobStore.findAllByLimit(now, 2).isEmpty());
     }
 
     /**

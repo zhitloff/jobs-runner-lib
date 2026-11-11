@@ -40,7 +40,7 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class JobsRunnerTest {
 
-    /** Хранилище задач с эмуляцией блокировки. */
+    /** Хранилище задач для тестов. */
     private final JobStore inmemoryJobStore = new InmemoryJobStore();
     /** Тестируемый оркестратор. */
     private JobsRunner jobsRunner;
@@ -110,7 +110,7 @@ class JobsRunnerTest {
         final Job job = buildJob("Job-1", new ScanDirJobInput(tempDir));
         inmemoryJobStore.add(job);
 
-        // оба start() выходят на findAllWithLock одновременно: job не должна достаться обоим
+        // оба start() видят одну и ту же задачу: второй должен отсечься на tryMarkRunning
         final int threadCount = 2;
         final CyclicBarrier barrier = new CyclicBarrier(threadCount);
         final ExecutorService executor = Executors.newFixedThreadPool(threadCount);
