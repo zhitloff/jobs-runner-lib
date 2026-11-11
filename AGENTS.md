@@ -16,13 +16,13 @@
 
 ## Структура
 
-- `core/JobsRunner` — оркестратор: берёт `JobStore.findAllWithLock`, помечает `tryMarkRunning`, запускает задачу и завершает через `completeRun`.
+- `core/JobsRunner` — оркестратор: берёт `JobStore.findAllByLimit`, помечает `tryMarkRunning`, запускает задачу и завершает через `completeRun`.
 - `core/handler/JobHandler` — обработчик: `supports(JobType)` + `JobResult<O> handle(I)`, типизирован по входу/выходу.
 - `core/io` — `JobInput`, `JobOutput`, sealed `JobResult` (`Success` / `Failure`), фабрики `JobResult.success/failure`.
 - `core/listeber` — **опечатка в имени пакета** (`listener`); не переименовывать без необходимости, иначе сломаются импорты.
 - `core/model` — `Job` (Lombok `@Data`), `JobType` (интерфейс с `name()`, реализуется enum'ами).
 - `core/store/JobStore` — точка расширения для хранения; комментарии в интерфейсе задают семантику:
-  `findAllWithLock` = `select for update`, `tryMarkRunning` = захват задачи (защита от двойного запуска),
+  `findAllByLimit` = выборка готовых задач без блокировки, `tryMarkRunning` = захват задачи (защита от двойного запуска),
   `completeRun(job, result, consumer)` = завершение + callback в одной транзакции; возвращает актуальное
   состояние задачи (может быть новым инстансом).
 
@@ -45,7 +45,7 @@
 
 - JUnit 5 (surefire 3.5.2), тесты в том же пакете, что и код, — это нужно, т.к. `JobsRunner.start` объявлен `protected`.
 - Тестовые реализации-фикстуры лежат в `src/test` (`ScanDirJobHandler`, `ScanDirJobInput/Output`, `JobsType`, `InmemoryJobStore`) и служат примером подключения нового типа задачи. `InmemoryJobStore` хранит задачи в `ConcurrentHashMap` и меняет тот же инстанс `Job`, поэтому сквозной сценарий через неё проходит.
-- `InmemoryJobStore` эмулирует `select for update`: `findAllWithLock` атомарно лочит задачи в `lockedJobIds`, `tryMarkRunning` переводит `SCHEDULED -> RUNNING` только один раз и снимает lock (`completeRun` — страховка). `InmemoryJobStoreTest` фиксирует это поведение, `JobsRunnerTest#start_parallelCalls_doNotRunJobTwice` — что параллельный `start()` не запускает задачу дважды.
+- `InmemoryJobStore` не блокирует задачи при выборке: `findAllByLimit` отдаёт все `SCHEDULED` задачи, `tryMarkRunning` переводит `SCHEDULED -> RUNNING` только один раз. `InmemoryJobStoreTest` фиксирует это поведение, `JobsRunnerTest#start_parallelCalls_doNotRunJobTwice` — что параллельный `start()` не запускает задачу дважды.
 - `JobsRunnerTest#start` сканирует `@TempDir` и ждёт статус `COMPLETED` (задача выполняется в виртуальном потоке, без ожидания тест завершится раньше неё).
 - SLF4J-провайдер в тестах — `slf4j-simple` (scope `test`); уровень `debug` и вывод в stdout заданы через `systemPropertyVariables` у surefire, иначе логи падают в NOP и их не видно.
 

@@ -19,8 +19,8 @@ import java.util.stream.Collectors;
  *
  * <p>Хранит задачи в {@link ConcurrentHashMap} и меняет тот же инстанс {@link Job},
  * который был добавлен в хранилище, поэтому тест может наблюдать статус по своей ссылке.
- * Эмулирует {@code select for update} набором залоченных идентификаторов
- * {@link #lockedJobIds}, чтобы параллельный вызов не взял уже залоченую задачу.
+ * Выборка задачи не блокирует: от двойного запуска защищает атомарный переход
+ * {@code SCHEDULED -> RUNNING} в {@link #tryMarkRunning}.
  *
  * <p>Не транзакционна и не предназначена для production.
  */
@@ -29,11 +29,6 @@ public class InmemoryJobStore implements JobStore {
 
     /** Задачи по идентификатору. */
     private final Map<UUID, Job> jobMap = new ConcurrentHashMap<>();
-    /**
-     * Залоченные задачи: эмуляция select for update, чтобы параллельный вызов
-     * {@link #findAllWithLock(Instant, int)} не взял уже залоченую задачу.
-     */
-    private final Set<UUID> lockedJobIds = ConcurrentHashMap.newKeySet();
 
     /**
      * Сохраняет задачу, проставляя id, время создания и статус {@code SCHEDULED}.
@@ -63,46 +58,35 @@ public class InmemoryJobStore implements JobStore {
     }
 
     /**
-     * Выбирает задачи в статусе {@code SCHEDULED} и атомарно лочит их.
+     * Выбирает задачи в статусе {@code SCHEDULED}, не блокируя их.
      *
-     * <p>Задача, уже залоченная параллельным вызовом, пропускается; лимит добирается
-     * по остальным кандидатам, поэтому блокировка не тратится на задачи за пределами выборки.
+     * <p>Задачу могут получить несколько параллельных вызовов — это нормально:
+     * выполнит её только тот, кто успешно захватит её в {@link #tryMarkRunning}.
      *
      * @param now   текущее время (в in-memory реализации не используется)
      * @param limit максимальное количество задач в выборке
-     * @return залоченные задачи в стабильном порядке: сначала более старые
+     * @return задачи в стабильном порядке: сначала более старые
      */
     @Override
-    public List<Job> findAllWithLock(Instant now, int limit) {
+    public List<Job> findAllByLimit(Instant now, int limit) {
         if (limit <= 0) return List.of();
         // с защитой от null и стабильным порядком
-        final List<Job> candidates = jobMap.values().stream()
+        return jobMap.values().stream()
                 .filter(job -> JobStatus.SCHEDULED.equals(job.getStatus()))
                 .sorted(Comparator
                         .comparing(Job::getCreatedAt,
                                 Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(Job::getId))
+                .limit(limit)
                 .toList();
-
-        final List<Job> dueWithLock = new ArrayList<>(Math.min(limit, candidates.size()));
-        for (Job job : candidates) {
-            if (dueWithLock.size() >= limit) {
-                break;
-            }
-            // lock на job: add атомарен, поэтому параллельный вызов пропустит уже залоченую задачу
-            if (lockedJobIds.add(job.getId())) {
-                dueWithLock.add(job);
-            }
-        }
-        return dueWithLock;
     }
 
     /**
      * Захватывает задачу: переводит её из {@code SCHEDULED} в {@code RUNNING}.
      *
      * <p>Переход выполняется атомарно и только один раз, поэтому повторный или
-     * параллельный вызов вернёт {@code false}. Lock, взятый в {@link #findAllWithLock},
-     * снимается: дальше задача не попадёт в выборку уже по статусу.
+     * параллельный вызов вернёт {@code false}. Захваченная задача дальше не попадает
+     * в выборку уже по статусу — блокировка при выборке не нужна.
      *
      * @param jobId идентификатор задачи
      * @param now   время начала выполнения
@@ -120,8 +104,6 @@ public class InmemoryJobStore implements JobStore {
             }
             return job;
         });
-        // после захвата задачу не вернёт уже фильтр по статусу, lock больше не нужен
-        lockedJobIds.remove(jobId);
         return marked.get();
     }
 
@@ -136,18 +118,13 @@ public class InmemoryJobStore implements JobStore {
      */
     @Override
     public Job completeRun(UUID jobId, JobResult<? extends JobOutput> jobResult, Consumer<Job> consumerJob) {
-        try {
-            Job job = jobMap.get(jobId);
-            if (job != null) {
-                this.enrichJobByResult(job, jobResult);
-                consumerJob.accept(job);
-                return job;
-            }
-            throw new RuntimeException("Job not fund by id = " + jobId);
-        } finally {
-            // страховка: lock не должен пережить завершение задачи
-            lockedJobIds.remove(jobId);
+        Job job = jobMap.get(jobId);
+        if (job != null) {
+            this.enrichJobByResult(job, jobResult);
+            consumerJob.accept(job);
+            return job;
         }
+        throw new RuntimeException("Job not fund by id = " + jobId);
     }
 
     /**
