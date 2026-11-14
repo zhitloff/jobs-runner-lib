@@ -24,6 +24,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,8 +36,8 @@ import java.util.stream.IntStream;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Сквозные тесты {@link JobsRunner}: одиночный запуск задачи и защита от двойного
- * выполнения при параллельных вызовах {@code start()}.
+ * Сквозные тесты {@link JobsRunner}: одиночный запуск задачи, защита от двойного
+ * выполнения при параллельных вызовах {@code start()} и лимит одновременных потоков.
  */
 class JobsRunnerTest {
 
@@ -131,6 +132,103 @@ class JobsRunnerTest {
 
         awaitStatus(job, JobStatus.COMPLETED, Duration.ofSeconds(10));
         assertEquals(1, handleCalls.get(), "при параллельном start() задача не должна выполняться дважды");
+    }
+
+    /**
+     * Проверяет, что {@code threadCountMax} ограничивает одновременные виртуальные потоки,
+     * а при исчерпании лимита {@code start()} не опрашивает хранилище.
+     *
+     * @param tempDir временная директория с файлом для сканирования
+     */
+    @Test
+    @SneakyThrows
+    void start_threadCountMax_limitsConcurrentThreads(@TempDir Path tempDir) {
+        final Path file = Files.writeString(tempDir.resolve("file.txt"), "test");
+        final int jobsCount = 3;
+        final int threadCountMax = 1;
+        final AtomicInteger findAllCalls = new AtomicInteger();
+        final AtomicInteger handleCalls = new AtomicInteger();
+        final AtomicInteger concurrent = new AtomicInteger();
+        final AtomicInteger maxConcurrent = new AtomicInteger();
+        final CountDownLatch firstStarted = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+
+        // считаем обращения к хранилищу: при достигнутом лимите их быть не должно
+        final JobStore countingJobStore = new InmemoryJobStore() {
+            @Override
+            public List<Job> findAllByLimit(Instant now, int limit) {
+                findAllCalls.incrementAndGet();
+                return super.findAllByLimit(now, limit);
+            }
+        };
+        final JobHandler<ScanDirJobInput, ScanDirJobOutput> blockingHandler = new JobHandler<>() {
+            @Override
+            public boolean supports(JobType jobType) {
+                return JobsType.SCAN_DIRECTORY.equals(jobType);
+            }
+
+            @Override
+            public JobResult<ScanDirJobOutput> handle(ScanDirJobInput jobInput) {
+                handleCalls.incrementAndGet();
+                maxConcurrent.accumulateAndGet(concurrent.incrementAndGet(), Math::max);
+                firstStarted.countDown();
+                try {
+                    // держим слот занятым, пока тест проверяет лимит
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    concurrent.decrementAndGet();
+                }
+                return JobResult.success(new ScanDirJobOutput(List.of(file.toString())));
+            }
+        };
+        final JobsRunner limitedJobsRunner = new JobsRunner(
+                List.of(blockingHandler), List.of(new ScanDirJobResultListener()), countingJobStore);
+        final List<Job> jobs = IntStream.rangeClosed(1, jobsCount)
+                .mapToObj(i -> buildJob("Job-" + i, new ScanDirJobInput(tempDir)))
+                .toList();
+        jobs.forEach(countingJobStore::add);
+
+        limitedJobsRunner.start(Instant.now(), jobsCount, threadCountMax);
+
+        assertTrue(firstStarted.await(10, TimeUnit.SECONDS), "первая задача должна стартовать");
+        // первый поток ещё занят: повторный start() не должен даже опрашивать хранилище
+        final int findAllCallsBefore = findAllCalls.get();
+        limitedJobsRunner.start(Instant.now(), jobsCount, threadCountMax);
+        assertEquals(findAllCallsBefore, findAllCalls.get(),
+                "при достигнутом лимите start() не должен вызывать jobStore.findAllByLimit()");
+        assertEquals(threadCountMax, handleCalls.get(), "повторный start() не должен запускать задачи");
+
+        release.countDown();
+        // слот освобождается после завершения задачи, поэтому опрашиваем раннер, как это делает планировщик
+        awaitAllCompleted(limitedJobsRunner, jobs, jobsCount, threadCountMax);
+
+        assertEquals(threadCountMax, maxConcurrent.get(),
+                "одновременно не должно выполняться больше задач, чем threadCountMax");
+        assertEquals(jobsCount, handleCalls.get());
+    }
+
+    /**
+     * Ждёт, пока все задачи перейдут в {@link JobStatus#COMPLETED}, периодически вызывая
+     * {@code start()} (слоты освобождаются только после завершения задач).
+     *
+     * @param jobsRunner     тестируемый оркестратор
+     * @param jobs           задачи
+     * @param jobLimit       размер пачки для {@code start()}
+     * @param threadCountMax лимит одновременных потоков
+     * @throws InterruptedException если ожидание прервано
+     */
+    private static void awaitAllCompleted(JobsRunner jobsRunner, List<Job> jobs, int jobLimit, int threadCountMax)
+            throws InterruptedException {
+        final Instant deadline = Instant.now().plus(Duration.ofSeconds(10));
+        while (jobs.stream().anyMatch(job -> !JobStatus.COMPLETED.equals(job.getStatus()))) {
+            if (Instant.now().isAfter(deadline)) {
+                fail("не все задачи завершились за 10 секунд: " + jobs);
+            }
+            jobsRunner.start(Instant.now(), jobLimit, threadCountMax);
+            Thread.sleep(50);
+        }
     }
 
     /**

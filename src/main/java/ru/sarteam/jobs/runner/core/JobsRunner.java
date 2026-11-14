@@ -12,6 +12,7 @@ import ru.sarteam.jobs.runner.core.store.JobStore;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Оркестратор запуска задач: берёт из {@link JobStore} задачи, готовые к выполнению,
@@ -35,9 +36,27 @@ public class JobsRunner {
     private final List<JobResultListener> jobResultListeners;
     /** Хранилище задач — точка расширения, реализуемая приложением-хостом. */
     private final JobStore jobStore;
+    /**
+     * Занятые слоты под виртуальные потоки: работающие задачи плюс зарезервированные,
+     * но ещё не запущенные. Счётчик живёт между вызовами {@link #start}, поэтому лимит
+     * соблюдается и при параллельных запусках.
+     */
+    private final AtomicInteger runningThreadCount = new AtomicInteger();
 
     /**
-     * Запускает пачку готовых к выполнению задач.
+     * Запускает пачку готовых к выполнению задач без ограничения количества потоков.
+     *
+     * <p>Эквивалентно {@code start(now, jobLimit, Integer.MAX_VALUE)}.
+     *
+     * @param now      текущее время, передаётся в хранилище при выборке и захвате
+     * @param jobLimit максимальное количество задач в пачке
+     */
+    protected void start(Instant now, int jobLimit) {
+        start(now, jobLimit, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Запускает пачку готовых к выполнению задач, не превышая лимит одновременных виртуальных потоков.
      *
      * <p>Метод ничего не блокирует в хранилище: параллельные вызовы могут выбрать одну и ту же
      * задачу, но выполнит её только тот, чей {@link JobStore#tryMarkRunning} вернул {@code true}.
@@ -45,25 +64,71 @@ public class JobsRunner {
      * не дожидаясь завершения задач. Задача без обработчика логируется и пропускается — пачка
      * не падает.
      *
-     * @param now   текущее время, передаётся в хранилище при выборке и захвате
-     * @param limit максимальное количество задач в пачке
+     * <p>Лимит {@code threadCountMax} считается по занятым слотам: работающий поток плюс слот,
+     * зарезервированный под задачу, которую ещё предстоит запустить. Если свободных слотов нет,
+     * {@link JobStore#findAllByLimit} не вызывается вовсе — выборка не тратится впустую.
+     * Значение {@code threadCountMax <= 0} означает «свободных слотов нет», поэтому {@code start}
+     * ничего не запускает (как и {@code jobLimit <= 0}).
+     *
+     * @param now            текущее время, передаётся в хранилище при выборке и захвате
+     * @param jobLimit       максимальное количество задач в пачке
+     * @param threadCountMax максимальное количество одновременно выполняемых задач
      */
-    protected void start(Instant now, int limit) {
-        jobStore.findAllByLimit(now, limit).forEach(job -> {
+    protected void start(Instant now, int jobLimit, int threadCountMax) {
+        final int running = runningThreadCount.get();
+        if (running >= threadCountMax) {
+            // Свободных слотов нет: хранилище не опрашиваем
+            log.debug("start() - threadCountMax reached, running = {}, threadCountMax = {}", running, threadCountMax);
+            return;
+        }
+        // Просим у хранилища не больше задач, чем есть свободных слотов
+        final int available = Math.min(jobLimit, threadCountMax - running);
+        for (Job job : jobStore.findAllByLimit(now, available)) {
             JobHandler<?, ?> jobHandler;
             try {
                 jobHandler = findHandlerByJob(job);
             } catch (RuntimeException e) {
                 // Задача без обработчика не должна останавливать запуск остальных
                 log.warn("start() - jobHandler not found, job = {}", job, e);
-                return;
+                continue;
+            }
+            // Слот занимаем до захвата задачи: иначе можно пометить задачу RUNNING и не запустить поток
+            if (!tryAcquireSlot(threadCountMax)) {
+                log.debug("start() - threadCountMax reached, job = {} skipped", job.getId());
+                break;
             }
             if (!jobStore.tryMarkRunning(job.getId(), now)) {
-                return;
+                // Задачу захватил параллельный вызов — слот не нужен
+                releaseSlot();
+                continue;
             }
             // Виртуальные потоки не пулируются: новый поток на каждую задачу
-            Thread.startVirtualThread(() -> run(jobHandler, job));
-        });
+            Thread.startVirtualThread(() -> {
+                try {
+                    run(jobHandler, job);
+                } finally {
+                    // Слот свободен только после завершения задачи: лимит действует на всё выполнение
+                    releaseSlot();
+                }
+            });
+        }
+    }
+
+    /**
+     * Атомарно занимает один слот под виртуальный поток.
+     *
+     * @param threadCountMax максимальное количество одновременно выполняемых задач
+     * @return {@code true}, если слот занят; {@code false}, если лимит исчерпан
+     */
+    private boolean tryAcquireSlot(int threadCountMax) {
+        // getAndUpdate вернёт значение до изменения: инкремент был, только если слот был свободен
+        return runningThreadCount.getAndUpdate(
+                current -> current < threadCountMax ? current + 1 : current) < threadCountMax;
+    }
+
+    /** Освобождает слот, занятый под виртуальный поток. */
+    private void releaseSlot() {
+        runningThreadCount.decrementAndGet();
     }
 
     /**
