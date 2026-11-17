@@ -1,6 +1,5 @@
 package ru.sarteam.jobs.runner.core;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import ru.sarteam.jobs.runner.core.handler.JobHandler;
 import ru.sarteam.jobs.runner.core.io.JobInput;
@@ -8,6 +7,7 @@ import ru.sarteam.jobs.runner.core.io.JobOutput;
 import ru.sarteam.jobs.runner.core.io.JobResult;
 import ru.sarteam.jobs.runner.core.listener.JobResultListener;
 import ru.sarteam.jobs.runner.core.model.Job;
+import ru.sarteam.jobs.runner.core.policy.JobTypeConcurrencyPolicy;
 import ru.sarteam.jobs.runner.core.store.JobStore;
 
 import java.time.Instant;
@@ -21,13 +21,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Порядок одного запуска:
  * <ol>
  *   <li>{@link JobStore#findAllByLimit} — выборка задач без блокировки;</li>
+ *   <li>{@link JobTypeConcurrencyPolicy#tryAcquire} — слот типа задачи;</li>
  *   <li>{@link JobStore#tryMarkRunning} — захват задачи (защита от двойного запуска);</li>
  *   <li>{@link JobHandler#handle} — выполнение задачи;</li>
  *   <li>{@link JobStore#completeRun} — завершение задачи и (опционально) нотификация слушателей.</li>
  * </ol>
  */
 @Slf4j
-@RequiredArgsConstructor
 public class JobsRunner {
 
     /** Обработчики задач; для одного типа задачи должен быть только один подходящий. */
@@ -36,12 +36,45 @@ public class JobsRunner {
     private final List<JobResultListener> jobResultListeners;
     /** Хранилище задач — точка расширения, реализуемая приложением-хостом. */
     private final JobStore jobStore;
+    /** Политика лимитов по типу задачи; по умолчанию — без лимита. */
+    private final JobTypeConcurrencyPolicy jobTypeConcurrencyPolicy;
     /**
      * Занятые слоты под виртуальные потоки: работающие задачи плюс зарезервированные,
      * но ещё не запущенные. Счётчик живёт между вызовами {@link #start}, поэтому лимит
      * соблюдается и при параллельных запусках.
      */
     private final AtomicInteger runningThreadCount = new AtomicInteger();
+
+    /**
+     * Создаёт оркестратор без лимитов по типам задач.
+     *
+     * @param jobHandlers        обработчики задач
+     * @param jobResultListeners слушатели результатов
+     * @param jobStore           хранилище задач
+     */
+    public JobsRunner(List<JobHandler<?, ?>> jobHandlers,
+                      List<JobResultListener> jobResultListeners,
+                      JobStore jobStore) {
+        this(jobHandlers, jobResultListeners, jobStore, JobTypeConcurrencyPolicy.unlimited());
+    }
+
+    /**
+     * Создаёт оркестратор с политикой лимитов по типам задач.
+     *
+     * @param jobHandlers              обработчики задач
+     * @param jobResultListeners       слушатели результатов
+     * @param jobStore                 хранилище задач
+     * @param jobTypeConcurrencyPolicy политика лимитов по типу задачи
+     */
+    public JobsRunner(List<JobHandler<?, ?>> jobHandlers,
+                      List<JobResultListener> jobResultListeners,
+                      JobStore jobStore,
+                      JobTypeConcurrencyPolicy jobTypeConcurrencyPolicy) {
+        this.jobHandlers = jobHandlers;
+        this.jobResultListeners = jobResultListeners;
+        this.jobStore = jobStore;
+        this.jobTypeConcurrencyPolicy = jobTypeConcurrencyPolicy;
+    }
 
     /**
      * Запускает пачку готовых к выполнению задач без ограничения количества потоков.
@@ -70,6 +103,11 @@ public class JobsRunner {
      * Значение {@code threadCountMax <= 0} означает «свободных слотов нет», поэтому {@code start}
      * ничего не запускает (как и {@code jobLimit <= 0}).
      *
+     * <p>Дополнительно {@link JobTypeConcurrencyPolicy} ограничивает количество одновременных
+     * задач отдельного типа. Слот типа занимается перед {@link JobStore#tryMarkRunning}; если
+     * лимит типа исчерпан, задача не захватывается, остаётся в {@code SCHEDULED} и не занимает
+     * слот потока — её заберёт следующий вызов {@code start}.
+     *
      * @param now            текущее время, передаётся в хранилище при выборке и захвате
      * @param jobLimit       максимальное количество задач в пачке
      * @param threadCountMax максимальное количество одновременно выполняемых задач
@@ -92,14 +130,30 @@ public class JobsRunner {
                 log.warn("start() - jobHandler not found, job = {}", job, e);
                 continue;
             }
-            // Слот занимаем до захвата задачи: иначе можно пометить задачу RUNNING и не запустить поток
+            // Сначала лимит типа: при отказе задача остаётся SCHEDULED и слот потока не занимает
+            if (!jobTypeConcurrencyPolicy.tryAcquire(job.getType())) {
+                log.debug("start() - jobType limit reached, job = {} skipped, type = {}",
+                        job.getId(), job.getType());
+                continue;
+            }
+            // Слот потока занимаем до захвата задачи: иначе можно пометить задачу RUNNING и не запустить поток
             if (!tryAcquireSlot(threadCountMax)) {
+                // Задача не будет запущена — слот типа нужно вернуть
+                jobTypeConcurrencyPolicy.release(job.getType());
                 log.debug("start() - threadCountMax reached, job = {} skipped", job.getId());
                 break;
             }
-            if (!jobStore.tryMarkRunning(job.getId(), now)) {
-                // Задачу захватил параллельный вызов — слот не нужен
-                releaseSlot();
+            final boolean marked;
+            try {
+                marked = jobStore.tryMarkRunning(job.getId(), now);
+            } catch (RuntimeException e) {
+                // Задача не захвачена: занятые слоты нужно вернуть, иначе они «потекут»
+                releaseJobSlots(job);
+                throw e;
+            }
+            if (!marked) {
+                // Задачу захватил параллельный вызов — слоты не нужны
+                releaseJobSlots(job);
                 continue;
             }
             // Виртуальные потоки не пулируются: новый поток на каждую задачу
@@ -107,11 +161,21 @@ public class JobsRunner {
                 try {
                     run(jobHandler, job);
                 } finally {
-                    // Слот свободен только после завершения задачи: лимит действует на всё выполнение
-                    releaseSlot();
+                    // Слоты свободны только после завершения задачи: лимиты действуют на всё выполнение
+                    releaseJobSlots(job);
                 }
             });
         }
+    }
+
+    /**
+     * Освобождает слоты задачи: общий слот потока и слот типа задачи.
+     *
+     * @param job задача
+     */
+    private void releaseJobSlots(Job job) {
+        releaseSlot();
+        jobTypeConcurrencyPolicy.release(job.getType());
     }
 
     /**

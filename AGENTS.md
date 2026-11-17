@@ -16,7 +16,7 @@
 
 ## Структура
 
-- `core/JobsRunner` — оркестратор: берёт `JobStore.findAllByLimit`, помечает `tryMarkRunning`, запускает задачу и завершает через `completeRun`.
+- `core/JobsRunner` — оркестратор: берёт `JobStore.findAllByLimit`, занимает слот типа и потока, помечает `tryMarkRunning`, запускает задачу и завершает через `completeRun`.
 - `core/handler/JobHandler` — обработчик: `supports(JobType)` + `JobResult<O> handle(I)`, типизирован по входу/выходу.
 - `core/io` — `JobInput`, `JobOutput`, sealed `JobResult` (`Success` / `Failure`), фабрики `JobResult.success/failure`.
 - `core/listeber` — **опечатка в имени пакета** (`listener`); не переименовывать без необходимости, иначе сломаются импорты.
@@ -25,6 +25,8 @@
   `findAllByLimit` = выборка готовых задач без блокировки, `tryMarkRunning` = захват задачи (защита от двойного запуска),
   `completeRun(job, result, consumer)` = завершение + callback в одной транзакции; возвращает актуальное
   состояние задачи (может быть новым инстансом).
+- `core/policy/JobTypeConcurrencyPolicy` — лимиты по типу задачи: `tryAcquire(type)` / `release(type)`;
+  `unlimited()` по умолчанию, `perType(map)` задаёт лимит только указанным типам.
 
 ## Инварианты, которые легко нарушить
 
@@ -37,12 +39,16 @@
   остаться в `RUNNING` без потока) и освобождается в `finally` потока. Если слотов нет, `start`
   не вызывает `findAllByLimit`. Счётчик живёт в экземпляре `JobsRunner`, т.е. лимит не общий
   для нескольких экземпляров/инстансов приложения.
+- Лимит типа задачи (`JobTypeConcurrencyPolicy.tryAcquire(job.getType())`) спрашивается **до**
+  `tryMarkRunning`; при отказе задача остаётся `SCHEDULED`, слот потока не занимается, цикл идёт
+  к следующей задаче. Слот типа освобождается в `finally` виртуального потока. По умолчанию —
+  `JobTypeConcurrencyPolicy.unlimited()`.
 - `JobHandler`/`JobResultListener` ищутся по первому совпадению `supports`, поэтому для одного `JobType` не должно быть двух обработчиков.
 
 ## Конвенции
 
 - Javadoc, комментарии и логи — по-русски; логи в формате `method() - start/end/error: ...` через Lombok `@Slf4j`.
-- Lombok: `@Data` для моделей, `@RequiredArgsConstructor` для конструкторов, `@Slf4j` для логов.
+- Lombok: `@Data` для моделей, `@RequiredArgsConstructor` для конструкторов (кроме перегруженных — например, у `JobsRunner` два конструктора), `@Slf4j` для логов.
 - Комментарии `// todo:` в модели (`Job`) — намеренные заметки автора, не удалять.
 
 ## Тесты
@@ -51,6 +57,7 @@
 - Тестовые реализации-фикстуры лежат в `src/test` (`ScanDirJobHandler`, `ScanDirJobInput/Output`, `JobsType`, `InmemoryJobStore`) и служат примером подключения нового типа задачи. `InmemoryJobStore` хранит задачи в `ConcurrentHashMap` и меняет тот же инстанс `Job`, поэтому сквозной сценарий через неё проходит.
 - `InmemoryJobStore` не блокирует задачи при выборке: `findAllByLimit` отдаёт все `SCHEDULED` задачи, `tryMarkRunning` переводит `SCHEDULED -> RUNNING` только один раз. `InmemoryJobStoreTest` фиксирует это поведение, `JobsRunnerTest#start_parallelCalls_doNotRunJobTwice` — что параллельный `start()` не запускает задачу дважды.
 - `JobsRunnerTest#start` сканирует `@TempDir` и ждёт статус `COMPLETED` (задача выполняется в виртуальном потоке, без ожидания тест завершится раньше неё).
+- `JobsRunnerTest#start_jobTypeLimit_keepsJobScheduledAndReleasesSlot` фиксирует, что задача сверх лимита типа остаётся `SCHEDULED`, не занимает слот потока и запускается после освобождения слота типа; `JobTypeConcurrencyPolicyTest` покрывает саму политику (лимиты, освобождение, гонки).
 - SLF4J-провайдер в тестах — `slf4j-simple` (scope `test`); уровень `debug` и вывод в stdout заданы через `systemPropertyVariables` у surefire, иначе логи падают в NOP и их не видно.
 
 ## Чего в репозитории нет

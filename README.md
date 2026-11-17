@@ -5,7 +5,7 @@
 библиотека встраивается в приложение-хост, которое даёт реализацию `JobStore`
 (БД, очередь, in-memory и т.п.).
 
-- **Координаты:** `ru.sarteam:jobs-runner-lib:1.0.0`
+- **Координаты:** `ru.sarteam:jobs-runner-lib:1.1.0`
 - **Пакет:** `ru.sarteam.jobs.runner.core`
 - **Java:** 21 (`maven.compiler.release`)
 - **Зависимости:** Lombok (`provided`), SLF4J API; Spring не требуется
@@ -15,6 +15,7 @@
 - Единый цикл запуска: выборка без блокировки → захват → выполнение → завершение.
 - Защита от двойного запуска задачи при параллельных вызовах `start()` (`tryMarkRunning`).
 - Выполнение задач в виртуальных потоках без пула, с настраиваемым лимитом одновременных потоков.
+- Лимиты параллельности по типу задачи (`JobTypeConcurrencyPolicy`): по умолчанию без ограничений.
 - Типизированные обработчики: тип входа и выхода задаётся через `JobHandler<I, O>`.
 - Расширяемые типы задач: `JobType` реализуется enum'ами приложения.
 - Слушатели результата для уведомлений, аудита и outbox-сценариев.
@@ -40,10 +41,13 @@ annotation processing неявно.
    кто успешно захватит её на следующем шаге.
 2. Поиск обработчика по `JobType` (первое совпадение `JobHandler.supports`).
    Если обработчика нет, задача логируется и пропускается, пачка не падает.
-3. `JobStore.tryMarkRunning(jobId, now)` — атомарный захват задачи. Если вернулось `false`,
+3. `JobTypeConcurrencyPolicy.tryAcquire(job.type)` — слот типа задачи. Если лимит типа
+   исчерпан, задача остаётся в `SCHEDULED`, не занимает слот потока и пропускается;
+   её заберёт следующий `start()`.
+4. `JobStore.tryMarkRunning(jobId, now)` — атомарный захват задачи. Если вернулось `false`,
    задача пропускается. Метод вызывается **до** выполнения обработчика.
-4. `JobHandler.handle(jobInput)` — выполнение задачи.
-5. `JobStore.completeRun(jobId, result, callback)` — завершение задачи и callback
+5. `JobHandler.handle(jobInput)` — выполнение задачи.
+6. `JobStore.completeRun(jobId, result, callback)` — завершение задачи и callback
    в одной транзакции; возвращает актуальное состояние задачи.
 
 Каждая задача выполняется в отдельном виртуальном потоке (`Thread.startVirtualThread`),
@@ -59,6 +63,28 @@ annotation processing неявно.
   потока, поэтому задача не может остаться в `RUNNING` из-за отсутствия слота;
 - `threadCountMax <= 0` означает «свободных слотов нет»: `start()` ничего не запускает
   (аналогично `jobLimit <= 0`).
+
+### Лимиты по типу задачи
+
+`JobTypeConcurrencyPolicy` ограничивает количество одновременно выполняемых задач
+отдельного типа независимо от общего `threadCountMax`:
+
+- политика спрашивается перед `tryMarkRunning`: при отказе задача не захватывается,
+  остаётся в `SCHEDULED` и **не занимает** слот потока;
+- слот типа освобождается в `finally` виртуального потока, то есть после завершения задачи;
+- по умолчанию используется `JobTypeConcurrencyPolicy.unlimited()` — типы не ограничены;
+- `JobTypeConcurrencyPolicy.perType(Map.of(MyJobType.HEAVY, 1))` задаёт лимит только
+  указанным типам, остальные остаются без ограничений;
+- счётчики живут в экземпляре политики, поэтому, как и `threadCountMax`, лимит действует
+  в рамках одного `JobsRunner` и не является общим для нескольких инстансов приложения.
+
+```java
+new JobsRunner(
+        List.of(jobHandler),
+        List.of(jobResultListener),
+        jobStore,
+        JobTypeConcurrencyPolicy.perType(Map.of(MyJobType.HEAVY, 1)));
+```
 
 Перегрузка `start(now, jobLimit)` оставлена для совместимости и означает «без лимита»
 (`Integer.MAX_VALUE`).
@@ -91,6 +117,7 @@ SCHEDULED ──tryMarkRunning──▶ RUNNING ──completeRun──▶ COMPL
 | Компонент | Назначение |
 |---|---|
 | `core.JobsRunner` | Оркестратор: выборка, захват, запуск в виртуальном потоке с лимитом, завершение и нотификация. |
+| `core.policy.JobTypeConcurrencyPolicy` | Политика лимитов по типу задачи: `tryAcquire(type)` / `release(type)`; по умолчанию без ограничений. |
 | `core.handler.JobHandler<I, O>` | Обработчик задачи: `supports(JobType)` + `JobResult<O> handle(I)`. |
 | `core.listener.JobResultListener` | Слушатель результата: `supports(JobType)`, `onSuccess`, `onFailure`. |
 | `core.io.JobInput` | Маркерный интерфейс входа задачи. |
@@ -171,14 +198,15 @@ public class LoggingJobResultListener implements JobResultListener {
     }
 }
 
-// 5. Запуск по расписанию
+// 5. Запуск по расписанию; политика ограничивает SCAN_DIRECTORY одной одновременной задачей
 public class JobScheduler extends JobsRunner {
 
     public JobScheduler(JobStore jobStore) {
         super(
                 List.of(new ScanDirJobHandler()),
                 List.of(new LoggingJobResultListener()),
-                jobStore);
+                jobStore,
+                JobTypeConcurrencyPolicy.perType(Map.of(ScanDirJobType.SCAN_DIRECTORY, 1)));
     }
 
     public void poll() {
@@ -204,8 +232,12 @@ public class JobScheduler extends JobsRunner {
 - Задачи выполняются в виртуальных потоках: `jobLimit` ограничивает размер пачки, `threadCountMax` —
   количество одновременных потоков. Слот занимается до `tryMarkRunning` и освобождается
   в `finally` потока.
+- Слот типа задачи (`JobTypeConcurrencyPolicy.tryAcquire`) занимается **перед** `tryMarkRunning`;
+  при отказе задача остаётся `SCHEDULED` и не занимает слот потока. Слот типа освобождается
+  в `finally` виртуального потока.
 - Лимит `threadCountMax` действует в рамках одного экземпляра `JobsRunner`: несколько экземпляров
-  (или инстансов приложения) делят хранилище, но не счётчик слотов.
+  (или инстансов приложения) делят хранилище, но не счётчик слотов. Лимиты
+  `JobTypeConcurrencyPolicy` действуют так же — в рамках экземпляра политики.
 
 ## Структура проекта
 
@@ -216,13 +248,15 @@ src/main/java/ru/sarteam/jobs/runner/core/
 ├── io/                          # JobInput, JobOutput, JobResult
 ├── listener/JobResultListener.java
 ├── model/                       # Job, JobStatus, JobType
+├── policy/                      # JobTypeConcurrencyPolicy, лимиты по типам
 └── store/JobStore.java          # точка расширения хранения
 
 src/test/java/ru/sarteam/jobs/runner/core/
-├── JobsRunnerTest.java          # сквозной запуск и защита от двойного запуска
+├── JobsRunnerTest.java          # сквозной запуск, гонки и лимиты
 ├── handler/ScanDirJobHandler.java
 ├── io/                          # JobsType, ScanDirJobInput/Output
 ├── listener/ScanDirJobResultListener.java
+├── policy/JobTypeConcurrencyPolicyTest.java
 └── store/                       # InmemoryJobStore, InmemoryJobStoreTest
 ```
 
@@ -239,6 +273,11 @@ src/test/java/ru/sarteam/jobs/runner/core/
   `start()` не запускают одну задачу дважды.
 - `JobsRunnerTest#start_threadCountMax_limitsConcurrentThreads` проверяет, что лимит
   одновременных потоков не превышается, а при исчерпании слотов `start()` не опрашивает хранилище.
+- `JobsRunnerTest#start_jobTypeLimit_keepsJobScheduledAndReleasesSlot` проверяет, что задача
+  сверх лимита типа остаётся `SCHEDULED`, не занимает слот потока и запускается после
+  освобождения слота типа.
+- `JobTypeConcurrencyPolicyTest` проверяет лимиты по типам, освобождение слотов
+  и потокобезопасность счётчиков.
 - `InmemoryJobStoreTest` фиксирует неблокирующую выборку и однократный захват.
 - Провайдер SLF4J в тестах — `slf4j-simple` (`test`); уровень `debug` и вывод в stdout
   заданы через `systemPropertyVariables` у surefire.
@@ -248,6 +287,8 @@ src/test/java/ru/sarteam/jobs/runner/core/
 - `InmemoryJobStore` — тестовая реализация, не транзакционная и не для production.
 - Нет пула: на каждую задачу создаётся виртуальный поток, ограничивает их только `threadCountMax`
   конкретного экземпляра `JobsRunner`.
+- Лимиты `JobTypeConcurrencyPolicy` не разделяются между экземплярами и инстансами приложения:
+  счётчики живут в экземпляре политики.
 - Нет встроенного планировщика: `start(...)` нужно вызывать извне (например, по cron
   в приложении-хосте).
 - Нет CI, форматтера/lint и миграций.

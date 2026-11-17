@@ -15,6 +15,7 @@ import ru.sarteam.jobs.runner.core.listener.ScanDirJobResultListener;
 import ru.sarteam.jobs.runner.core.model.Job;
 import ru.sarteam.jobs.runner.core.model.JobStatus;
 import ru.sarteam.jobs.runner.core.model.JobType;
+import ru.sarteam.jobs.runner.core.policy.JobTypeConcurrencyPolicy;
 import ru.sarteam.jobs.runner.core.store.InmemoryJobStore;
 import ru.sarteam.jobs.runner.core.store.JobStore;
 
@@ -23,6 +24,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -207,6 +209,72 @@ class JobsRunnerTest {
         assertEquals(threadCountMax, maxConcurrent.get(),
                 "одновременно не должно выполняться больше задач, чем threadCountMax");
         assertEquals(jobsCount, handleCalls.get());
+    }
+
+    /**
+     * Проверяет, что лимит по типу задачи оставляет лишнюю задачу в {@code SCHEDULED},
+     * не занимает слот потока и освобождается после завершения выполняющейся задачи.
+     *
+     * @param tempDir временная директория с файлом для сканирования
+     */
+    @Test
+    @SneakyThrows
+    void start_jobTypeLimit_keepsJobScheduledAndReleasesSlot(@TempDir Path tempDir) {
+        final Path file = Files.writeString(tempDir.resolve("file.txt"), "test");
+        final AtomicInteger handleCalls = new AtomicInteger();
+        final AtomicInteger concurrent = new AtomicInteger();
+        final AtomicInteger maxConcurrent = new AtomicInteger();
+        final CountDownLatch firstStarted = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+
+        final JobHandler<ScanDirJobInput, ScanDirJobOutput> blockingHandler = new JobHandler<>() {
+            @Override
+            public boolean supports(JobType jobType) {
+                return JobsType.SCAN_DIRECTORY.equals(jobType);
+            }
+
+            @Override
+            public JobResult<ScanDirJobOutput> handle(ScanDirJobInput jobInput) {
+                handleCalls.incrementAndGet();
+                maxConcurrent.accumulateAndGet(concurrent.incrementAndGet(), Math::max);
+                firstStarted.countDown();
+                try {
+                    // держим слот типа занятым, пока тест проверяет лимит
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    concurrent.decrementAndGet();
+                }
+                return JobResult.success(new ScanDirJobOutput(List.of(file.toString())));
+            }
+        };
+        // лимит типа 1: вторая задача того же типа не должна запуститься одновременно с первой
+        final JobsRunner typeLimitedJobsRunner = new JobsRunner(
+                List.of(blockingHandler),
+                List.of(new ScanDirJobResultListener()),
+                inmemoryJobStore,
+                JobTypeConcurrencyPolicy.perType(Map.of(JobsType.SCAN_DIRECTORY, 1)));
+        final List<Job> jobs = List.of(
+                buildJob("Job-1", new ScanDirJobInput(tempDir)),
+                buildJob("Job-2", new ScanDirJobInput(tempDir)));
+        inmemoryJobStore.addAll(jobs);
+
+        typeLimitedJobsRunner.start(Instant.now(), jobs.size(), 2);
+
+        assertTrue(firstStarted.await(10, TimeUnit.SECONDS), "первая задача должна стартовать");
+        assertEquals(1, handleCalls.get(), "при лимите типа должна выполняться только одна задача");
+        assertEquals(1, jobs.stream()
+                        .filter(job -> JobStatus.SCHEDULED.equals(job.getStatus()))
+                        .count(),
+                "задача сверх лимита типа должна остаться в SCHEDULED");
+
+        release.countDown();
+        // слот освобождается в finally виртуального потока, поэтому следующая задача запустится
+        awaitAllCompleted(typeLimitedJobsRunner, jobs, jobs.size(), 2);
+
+        assertEquals(jobs.size(), handleCalls.get(), "после освобождения слота должны выполниться обе задачи");
+        assertEquals(1, maxConcurrent.get(), "одновременно не должно выполняться больше задач, чем лимит типа");
     }
 
     /**
